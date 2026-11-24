@@ -7,7 +7,7 @@ from auth import AuthHeader, require_user, require_writer
 from db import connect, now_iso, write_audit
 from locks import release, require_lock
 from models import OverloadCloseIn, OverloadOpenIn
-from validators import adjudicate_overload, validate_ticket_mutable
+from validators import adjudicate_overload, is_axle_locked, validate_ticket_mutable
 
 router = APIRouter(tags=["overload"])
 
@@ -42,6 +42,8 @@ def open_overload(body: OverloadOpenIn, authorization: AuthHeader = None):
             if not ticket:
                 raise HTTPException(404, "过磅票不存在")
             validate_ticket_mutable(dict(ticket))
+            if is_axle_locked(conn, dict(ticket)):
+                raise HTTPException(409, "封后禁改：闸代已生效，不得重开超重挂起")
             open_one = conn.execute(
                 """SELECT id FROM overload_holds WHERE ticket_id=? AND status='开放'""",
                 (body.ticket_id,),
@@ -117,6 +119,13 @@ def close_overload(body: OverloadCloseIn, authorization: AuthHeader = None):
                 (hold["ticket_id"],),
             ).fetchone()["c"]
             if not open_left:
+                ticket = conn.execute(
+                    "SELECT * FROM weigh_tickets WHERE id=?", (hold["ticket_id"],)
+                ).fetchone()
+                if is_axle_locked(conn, dict(ticket)):
+                    raise HTTPException(
+                        409, "封后禁改：闸代已生效，不得回退票态"
+                    )
                 conn.execute(
                     """UPDATE weigh_tickets SET status='已裁定', adjudicated_at=?
                        WHERE id=?""",

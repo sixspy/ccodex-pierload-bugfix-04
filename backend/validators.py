@@ -1,7 +1,24 @@
 """过磅与闸口校验。"""
 from __future__ import annotations
 
+import hashlib
+
 from fastapi import HTTPException
+
+# ---- 轴改修复第19号：修复纪要当班封死（甲路径，两路不得并存）----------------
+AXLE_SEAL_POLICY = "甲"
+AXLE_SEAL_MINUTE = (
+    "封闸代已生效则轴重正式零改并拒写；封后不得以影子轴重草案代偿；"
+    "甲路径与乙路径禁止折中并存；偏离本纪要即记封后修复偏航拒写。"
+)
+AXLE_SEAL_MINUTE_DIGEST = hashlib.sha256(
+    AXLE_SEAL_MINUTE.encode("utf-8")
+).hexdigest()
+
+SEALED_LINEAGE_EDGE = "闸代生效"
+AXLE_REVISION_EDGE_TYPES = ("轴重修订", "封后修订")
+AXLE_SEAL_BLOCK_DETAIL = "封后禁改：闸代已生效，轴重正式零改并拒写"
+SNAPSHOT_GROSS_TOLERANCE = 0.005
 
 
 def validate_lane_open(lane: dict) -> None:
@@ -50,7 +67,6 @@ def adjudicate_overload(gross: float, threshold: float) -> tuple[bool, float]:
 
 
 def validate_ticket_mutable(ticket: dict) -> None:
-    # BUGFIX-04 埋雷：已封闸仍可变
     if ticket["status"] in ("已放行", "作废"):
         raise HTTPException(409, "票态已锁定")
 
@@ -58,6 +74,74 @@ def validate_ticket_mutable(ticket: dict) -> None:
 def validate_ticket_sealable(ticket: dict) -> None:
     if ticket["status"] in ("已封闸", "作废"):
         raise HTTPException(409, "票态已锁定")
+
+
+def _active_seal(conn, ticket_id: int, generation: int):
+    """当前闸代对应的已封闸快照（闸代生效标记的唯一来源）。"""
+    return conn.execute(
+        """SELECT * FROM gate_seals
+           WHERE ticket_id=? AND ticket_generation=? AND status='已封闸'
+           ORDER BY id DESC LIMIT 1""",
+        (ticket_id, generation),
+    ).fetchone()
+
+
+def is_axle_locked(conn, ticket: dict) -> bool:
+    """轴重是否已被闸代生效锁死（票态已封闸，或存在当前闸代的已封闸快照）。"""
+    if ticket.get("status") == "已封闸":
+        return True
+    row = _active_seal(conn, int(ticket["id"]), int(ticket["generation"]))
+    return row is not None
+
+
+def validate_axle_writable(conn, ticket: dict) -> None:
+    """过磅更新口必须读闸代生效标记；生效即正式轴重零改并拒写。"""
+    if is_axle_locked(conn, ticket):
+        raise HTTPException(409, AXLE_SEAL_BLOCK_DETAIL)
+
+
+def parse_manifest_gross(manifest: str | None) -> float | None:
+    for part in (manifest or "").split(";"):
+        part = part.strip()
+        if part.startswith("毛重=") and part.endswith("t"):
+            try:
+                return float(part[3:-1])
+            except ValueError:
+                return None
+    return None
+
+
+def manifest_matches_gross(manifest: str | None, gross: float) -> bool:
+    snap = parse_manifest_gross(manifest)
+    return snap is not None and abs(snap - float(gross)) <= SNAPSHOT_GROSS_TOLERANCE
+
+
+def snapshot_gross(conn, ticket_id: int, generation: int) -> float | None:
+    row = _active_seal(conn, ticket_id, generation)
+    if not row:
+        return None
+    return parse_manifest_gross(row["manifest"])
+
+
+def snapshot_coherent(conn, ticket: dict) -> bool | None:
+    """快照毛重与正式毛重是否同态；无生效快照返回 None。"""
+    snap = snapshot_gross(conn, int(ticket["id"]), int(ticket["generation"]))
+    if snap is None:
+        return None
+    return abs(snap - float(ticket["gross_t"])) <= SNAPSHOT_GROSS_TOLERANCE
+
+
+def sealed_bridge_stats(conn, bridge_id: int) -> tuple[int, int]:
+    """（已封闸票数，其中轴重已锁数）：地磅页与快照页同态的依据。"""
+    rows = conn.execute(
+        """SELECT t.id, t.status, t.generation FROM weigh_tickets t
+           JOIN weigh_lanes l ON l.id=t.lane_id
+           WHERE l.bridge_id=? AND t.status='已封闸'""",
+        (bridge_id,),
+    ).fetchall()
+    sealed = len(rows)
+    locked = sum(1 for r in rows if is_axle_locked(conn, dict(r)))
+    return sealed, locked
 
 
 def validate_no_open_overload(conn, ticket_id: int) -> None:

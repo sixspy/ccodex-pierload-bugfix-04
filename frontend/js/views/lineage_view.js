@@ -22,15 +22,20 @@ export const lineageViewTemplate = `
     <button class="secondary" @click="refresh">刷新</button>
   </div>
   <table class="data-table">
-    <thead><tr><th>自</th><th>至</th><th>类型</th><th>说明</th></tr></thead>
+    <thead><tr><th>自</th><th>至</th><th>类型</th><th>说明</th><th>闸代</th></tr></thead>
     <tbody>
       <tr v-for="e in lineageEdges" :key="e.id">
         <td>{{ e.from_code || e.from_ticket_id }}</td>
         <td>{{ e.to_code || '—' }}</td>
         <td>{{ e.edge_type }}</td>
         <td>{{ e.detail }}</td>
+        <td>
+          <span v-if="e.from_seal_generation" class="badge warn">闸代 {{ e.from_seal_generation }} 生效</span>
+          <span v-else class="muted">—</span>
+        </td>
       </tr>
     </tbody>
   </table>
+  <p class="hint">封后禁改：闸代生效后不得登记轴重修订边，影子草案不得混入血缘。</p>
 </section>
 `;

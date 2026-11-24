@@ -30,6 +30,10 @@ export const bridgesViewTemplate = `
   <div v-if="bridgeDetail" class="detail-box">
     <h3>{{ bridgeDetail.bridge.name }} · {{ bridgeDetail.bridge.bridge_code }}</h3>
     <p>在港票 {{ bridgeDetail.active_tickets }} · 车道 {{ bridgeDetail.lanes.length }} 条</p>
+    <p>已封闸 {{ bridgeDetail.sealed_tickets }} 票 · 轴重锁定 {{ bridgeDetail.axle_locked_tickets }} 票</p>
+    <p v-if="bridgeDetail.axle_locked_tickets !== bridgeDetail.sealed_tickets" class="bad">
+      封闸票轴重锁定数不一致，须核查
+    </p>
   </div>
 </section>
 `;

@@ -6,6 +6,7 @@ from fastapi import APIRouter, HTTPException
 from auth import AuthHeader, require_user, require_writer
 from db import connect, now_iso, write_audit
 from models import BridgeIn
+from validators import sealed_bridge_stats
 
 router = APIRouter(tags=["bridges"])
 
@@ -39,10 +40,13 @@ def get_bridge(bridge_id: int, authorization: AuthHeader = None):
                WHERE l.bridge_id=? AND t.status NOT IN ('作废','已封闸')""",
             (bridge_id,),
         ).fetchone()
+        sealed, locked = sealed_bridge_stats(conn, bridge_id)
         return {
             "bridge": dict(row),
             "lanes": [dict(x) for x in lanes],
             "active_tickets": stats["active"],
+            "sealed_tickets": sealed,
+            "axle_locked_tickets": locked,
         }
 
 

@@ -11,10 +11,14 @@ from locks import release, require_lock
 from models import TicketIn
 from validators import (
     adjudicate_overload,
+    is_axle_locked,
+    snapshot_coherent,
     validate_axle_count,
     validate_axle_weights,
+    validate_axle_writable,
     validate_gross_cap,
     validate_lane_open,
+    validate_ticket_mutable,
 )
 
 router = APIRouter(tags=["tickets"])
@@ -48,29 +52,52 @@ def list_tickets(authorization: AuthHeader = None, status: str | None = None):
         for r in rows:
             d = dict(r)
             d["axle_weights"] = json.loads(d["axle_weights"] or "[]")
+            _decorate_seal_state(conn, d)
             items.append(d)
         return {"items": items}
 
 
+def _decorate_seal_state(conn, data: dict) -> None:
+    """过磅页/详情页读取的闸代生效标记：轴重是否锁死、快照与正式是否同态。"""
+    data["axle_locked"] = is_axle_locked(conn, data)
+    data["snapshot_match"] = snapshot_coherent(conn, data)
+    data["seal_generation"] = (
+        int(data["generation"]) if data["axle_locked"] else None
+    )
+
 
 @router.post("/api/tickets/{ticket_id}/axles")
 def patch_axles(ticket_id: int, body: dict, authorization: AuthHeader = None):
-    """BUGFIX-04 埋雷写口：已封闸仍可回写轴重。"""
+    """轴重回写口（BUGFIX-04 修复）：先抢票锁，再读闸代生效标记。
+
+    甲路径：闸代生效即正式轴重零改并拒写；不落影子草案。
+    争用：后到会话只记争用痕，不写业务。
+    """
     user = require_writer(authorization)
+    lock_key = f"ticket:{ticket_id}"
     with connect() as conn:
-        ticket = conn.execute("SELECT * FROM weigh_tickets WHERE id=?", (ticket_id,)).fetchone()
-        if not ticket:
-            raise HTTPException(404, "过磅票不存在")
-        validate_ticket_mutable(dict(ticket))
-        axles = body.get("axle_weights") or []
-        gross, _, _ = validate_axle_weights(axles)
-        conn.execute(
-            "UPDATE weigh_tickets SET axle_weights=?, gross_t=? WHERE id=?",
-            (json.dumps(axles, ensure_ascii=False), gross, ticket_id),
-        )
-        write_audit(conn, user, "ticket_axle_patch", ticket["ticket_code"], {"gross_t": gross})
-        conn.commit()
-        return {"ok": True, "gross_t": gross, "status": ticket["status"]}
+        require_lock(conn, lock_key, user)
+        try:
+            ticket = conn.execute(
+                "SELECT * FROM weigh_tickets WHERE id=?", (ticket_id,)
+            ).fetchone()
+            if not ticket:
+                raise HTTPException(404, "过磅票不存在")
+            validate_ticket_mutable(dict(ticket))
+            validate_axle_writable(conn, dict(ticket))
+            axles = body.get("axle_weights") or []
+            gross, _, _ = validate_axle_weights(axles)
+            conn.execute(
+                "UPDATE weigh_tickets SET axle_weights=?, gross_t=? WHERE id=?",
+                (json.dumps(axles, ensure_ascii=False), gross, ticket_id),
+            )
+            write_audit(
+                conn, user, "ticket_axle_patch", ticket["ticket_code"], {"gross_t": gross}
+            )
+            conn.commit()
+            return {"ok": True, "gross_t": gross, "status": ticket["status"]}
+        finally:
+            release(conn, lock_key, user)
 
 
 @router.get("/api/tickets/{ticket_id}")
@@ -89,6 +116,7 @@ def get_ticket(ticket_id: int, authorization: AuthHeader = None):
             raise HTTPException(404, "过磅票不存在")
         data = dict(row)
         data["axle_weights"] = json.loads(data["axle_weights"] or "[]")
+        _decorate_seal_state(conn, data)
         holds = conn.execute(
             "SELECT * FROM overload_holds WHERE ticket_id=? ORDER BY id DESC",
             (ticket_id,),

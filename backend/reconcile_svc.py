@@ -4,7 +4,7 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException
 
 from auth import AuthHeader, require_user
-from validators import validate_bl_match
+from validators import snapshot_coherent, validate_bl_match
 
 router = APIRouter(tags=["reconcile"])
 
@@ -43,7 +43,7 @@ def _reconcile_bl(conn, bl_code: str) -> dict:
         "SELECT * FROM bl_manifests WHERE bl_code=?", (bl_code,)
     ).fetchone()
     tickets = conn.execute(
-        """SELECT ticket_code, gross_t, status, generation FROM weigh_tickets
+        """SELECT id, ticket_code, gross_t, status, generation FROM weigh_tickets
            WHERE bl_ref=? AND status NOT IN ('作废')""",
         (bl_code,),
     ).fetchall()
@@ -65,12 +65,20 @@ def _reconcile_bl(conn, bl_code: str) -> dict:
            WHERE t.bl_ref=?""",
         (bl_code,),
     ).fetchall()
-    proof_ok = matched and len(seal_rows) >= 1
+    # 快照同态：任一已封票的生效快照毛重与正式毛重错位，对账不得判绿。
+    snapshot_match = True
+    for t in tickets:
+        coherent = snapshot_coherent(conn, dict(t))
+        if coherent is False:
+            snapshot_match = False
+            break
+    proof_ok = matched and snapshot_match and len(seal_rows) >= 1
     return {
         "bl_code": bl_code,
         "declared_gross_t": declared,
         "ticket_sum_t": ticket_sum,
         "balanced": matched,
+        "snapshot_match": snapshot_match,
         "proof_ready": proof_ok,
         "seal_count": len(seal_rows),
         "tickets": [dict(t) for t in tickets],
@@ -109,6 +117,7 @@ def proof_ticket(ticket_code: str, authorization: AuthHeader = None):
             manifest_match = validate_bl_match(
                 float(bl["declared_gross_t"]), float(ticket["gross_t"])
             )
+        seal_snapshot_match = snapshot_coherent(conn, dict(ticket))
         return {
             "ticket_code": ticket_code,
             "bl_ref": ticket["bl_ref"],
@@ -116,9 +125,13 @@ def proof_ticket(ticket_code: str, authorization: AuthHeader = None):
             "manifest_matches_bl": manifest_match,
             "has_seal": seal is not None,
             "seal_generation": seal["ticket_generation"] if seal else None,
+            "snapshot_match": seal_snapshot_match,
             "released": release is not None,
             "overload_closed": overload_closed,
             "coherent": bool(
-                manifest_match and overload_closed and (seal or release)
+                manifest_match
+                and overload_closed
+                and (seal or release)
+                and seal_snapshot_match is not False
             ),
         }

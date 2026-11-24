@@ -6,8 +6,30 @@ from fastapi import APIRouter, HTTPException
 from auth import AuthHeader, require_user, require_writer
 from db import connect, now_iso, write_audit
 from models import LineageIn
+from validators import (
+    AXLE_REVISION_EDGE_TYPES,
+    SEALED_LINEAGE_EDGE,
+    is_axle_locked,
+    parse_manifest_gross,
+)
 
 router = APIRouter(tags=["lineage"])
+
+
+def _decorate_edge(conn, edge: dict) -> dict:
+    """闸代生效边回显所属闸代与快照毛重；供血缘页与快照页同态核对。"""
+    if edge.get("edge_type") != SEALED_LINEAGE_EDGE:
+        return edge
+    seal = conn.execute(
+        """SELECT * FROM gate_seals WHERE ticket_id=? AND status='已封闸'
+           ORDER BY id DESC LIMIT 1""",
+        (edge["from_ticket_id"],),
+    ).fetchone()
+    if seal:
+        edge["from_seal_generation"] = int(seal["ticket_generation"])
+        edge["from_seal_ref"] = seal["seal_ref"]
+        edge["from_manifest_gross"] = parse_manifest_gross(seal["manifest"])
+    return edge
 
 
 @router.get("/api/lineage")
@@ -21,7 +43,7 @@ def list_lineage(authorization: AuthHeader = None):
                LEFT JOIN weigh_tickets b ON b.id=e.to_ticket_id
                ORDER BY e.id DESC"""
         ).fetchall()
-        return {"items": [dict(r) for r in rows]}
+        return {"items": [_decorate_edge(conn, dict(r)) for r in rows]}
 
 
 @router.get("/api/lineage/ticket/{ticket_id}")
@@ -41,8 +63,8 @@ def lineage_for_ticket(ticket_id: int, authorization: AuthHeader = None):
             (ticket_id,),
         ).fetchall()
         return {
-            "outbound": [dict(x) for x in out_edges],
-            "inbound": [dict(x) for x in in_edges],
+            "outbound": [_decorate_edge(conn, dict(x)) for x in out_edges],
+            "inbound": [_decorate_edge(conn, dict(x)) for x in in_edges],
         }
 
 
@@ -62,6 +84,15 @@ def add_lineage(body: LineageIn, authorization: AuthHeader = None):
             ).fetchone()
             if not to:
                 raise HTTPException(404, "终点票不存在")
+        if body.edge_type in AXLE_REVISION_EDGE_TYPES:
+            fr_ticket = conn.execute(
+                "SELECT * FROM weigh_tickets WHERE id=?", (body.from_ticket_id,)
+            ).fetchone()
+            if is_axle_locked(conn, dict(fr_ticket)):
+                raise HTTPException(
+                    409,
+                    "封后禁改：闸代已生效，不得登记轴重修订边（影子草案不得混入血缘）",
+                )
         now = now_iso()
         cur = conn.execute(
             """INSERT INTO axle_lineage(from_ticket_id,to_ticket_id,edge_type,detail,created_at)

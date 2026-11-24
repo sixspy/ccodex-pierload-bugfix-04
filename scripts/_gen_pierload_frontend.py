@@ -263,6 +263,10 @@ export const bridgesViewTemplate = `
   <div v-if="bridgeDetail" class="detail-box">
     <h3>{{ bridgeDetail.bridge.name }} · {{ bridgeDetail.bridge.bridge_code }}</h3>
     <p>在港票 {{ bridgeDetail.active_tickets }} · 车道 {{ bridgeDetail.lanes.length }} 条</p>
+    <p>已封闸 {{ bridgeDetail.sealed_tickets }} 票 · 轴重锁定 {{ bridgeDetail.axle_locked_tickets }} 票</p>
+    <p v-if="bridgeDetail.axle_locked_tickets !== bridgeDetail.sealed_tickets" class="bad">
+      封闸票轴重锁定数不一致，须核查
+    </p>
   </div>
 </section>
 `;"""
@@ -293,7 +297,7 @@ export const ticketsViewTemplate = `
     <button class="secondary" @click="refresh">刷新</button>
   </div>
   <table class="data-table">
-    <thead><tr><th>票号</th><th>车道</th><th>提单</th><th>毛重</th><th>状态</th><th>代</th><th></th></tr></thead>
+    <thead><tr><th>票号</th><th>车道</th><th>提单</th><th>毛重</th><th>状态</th><th>代</th><th>轴重</th><th></th></tr></thead>
     <tbody>
       <tr v-for="t in tickets" :key="t.id" @click="selectTicket(t)">
         <td>{{ t.ticket_code }}</td>
@@ -302,12 +306,17 @@ export const ticketsViewTemplate = `
         <td>{{ fmtT(t.gross_t) }}</td>
         <td><span class="badge" :class="ticketClass(t.status)">{{ t.status }}</span></td>
         <td>{{ t.generation }}</td>
+        <td><span v-if="t.axle_locked" class="badge warn">轴重锁定</span><span v-else class="badge pass">可采集</span></td>
         <td><button class="mini-btn" @click.stop="loadTicketDetail(t.id)">详情</button></td>
       </tr>
     </tbody>
   </table>
   <div v-if="ticketDetail" class="detail-box">
     <p>车牌 {{ ticketDetail.ticket.vehicle_plate }} · 超重挂起 {{ ticketDetail.overload_holds.length }} 条</p>
+    <p v-if="ticketDetail.ticket.axle_locked" class="bad">
+      闸代 {{ ticketDetail.ticket.seal_generation }} 已生效 · 封后禁改：轴重正式零改并拒写
+    </p>
+    <p v-else class="ok">闸代未生效 · 轴重可按正式口径回写</p>
   </div>
 </section>
 `;"""
@@ -397,17 +406,23 @@ export const sealViewTemplate = `
     <button class="secondary" @click="refresh">刷新</button>
   </div>
   <table class="data-table">
-    <thead><tr><th>快照号</th><th>票号</th><th>闸代</th><th>清单摘要</th><th>状态</th></tr></thead>
+    <thead><tr><th>快照号</th><th>票号</th><th>闸代</th><th>清单摘要</th><th>快照毛重</th><th>同态</th><th>状态</th></tr></thead>
     <tbody>
       <tr v-for="s in seals" :key="s.id">
         <td>{{ s.seal_ref }}</td>
         <td>{{ s.ticket_code }}</td>
         <td>{{ s.ticket_generation }}</td>
         <td class="mono">{{ shortText(s.manifest) }}</td>
+        <td>{{ fmtT(s.manifest_gross) }}</td>
+        <td>
+          <span v-if="s.snapshot_match" class="badge pass">同态</span>
+          <span v-else class="badge fail">错位</span>
+        </td>
         <td><span class="badge pass">{{ s.status }}</span></td>
       </tr>
     </tbody>
   </table>
+  <p class="hint">封后禁改：闸代生效的票轴重正式零改，快照毛重须与正式毛重同态。</p>
 </section>
 `;"""
 
@@ -466,16 +481,21 @@ export const lineageViewTemplate = `
     <button class="secondary" @click="refresh">刷新</button>
   </div>
   <table class="data-table">
-    <thead><tr><th>自</th><th>至</th><th>类型</th><th>说明</th></tr></thead>
+    <thead><tr><th>自</th><th>至</th><th>类型</th><th>说明</th><th>闸代</th></tr></thead>
     <tbody>
       <tr v-for="e in lineageEdges" :key="e.id">
         <td>{{ e.from_code || e.from_ticket_id }}</td>
         <td>{{ e.to_code || '—' }}</td>
         <td>{{ e.edge_type }}</td>
         <td>{{ e.detail }}</td>
+        <td>
+          <span v-if="e.from_seal_generation" class="badge warn">闸代 {{ e.from_seal_generation }} 生效</span>
+          <span v-else class="muted">—</span>
+        </td>
       </tr>
     </tbody>
   </table>
+  <p class="hint">封后禁改：闸代生效后不得登记轴重修订边，影子草案不得混入血缘。</p>
 </section>
 `;"""
 
@@ -495,6 +515,9 @@ export const reconcileViewTemplate = `
     <div v-if="reconOne" class="detail-box">
       <p>申报 {{ reconOne.declared_gross_t }}t · 过磅合计 {{ reconOne.ticket_sum_t }}t</p>
       <p :class="reconOne.balanced ? 'ok' : 'bad'">{{ reconOne.balanced ? '账实平衡' : '偏差待查' }}</p>
+      <p :class="reconOne.snapshot_match ? 'ok' : 'bad'">
+        快照同态 {{ reconOne.snapshot_match ? '是' : '否（错位不得判绿）' }}
+      </p>
       <p>快照数 {{ reconOne.seal_count }} · 可出证明 {{ reconOne.proof_ready ? '是' : '否' }}</p>
     </div>
     <ul v-if="reconAllItems.length">
@@ -508,6 +531,7 @@ export const reconcileViewTemplate = `
     <div v-if="proofOne" class="detail-box">
       <p>提单匹配 {{ proofOne.manifest_matches_bl ? '是' : '否' }}</p>
       <p>超重闭环 {{ proofOne.overload_closed ? '是' : '否' }}</p>
+      <p>快照同态 {{ proofOne.snapshot_match === false ? '否' : '是' }}</p>
       <p>已放行 {{ proofOne.released ? '是' : '否' }}</p>
       <p>一致 {{ proofOne.coherent ? '是' : '否' }}</p>
     </div>
